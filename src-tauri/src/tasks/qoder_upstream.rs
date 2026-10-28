@@ -1810,18 +1810,59 @@ pub fn content_to_text(content: &Value) -> String {
     }
 }
 
-/// 抽出消息里的图片块（OpenAI 的 image_url 形态）
+/// 抽出消息里的图片块：主形态 OpenAI `image_url`；防御性识别 Anthropic `image`
+/// 与 Responses `input_image` 变体（issue #154——payload.rs/wb_responses.rs 投影
+/// 后已是 image_url，此处覆盖绕过投影直入 chat completions 的非标准块），
+/// 统一归一为 image_url 形态
 fn images_of(content: &Value) -> Vec<Value> {
     content
         .as_array()
         .map(|items| {
             items
                 .iter()
-                .filter(|item| item.get("type").and_then(Value::as_str) == Some("image_url"))
-                .cloned()
+                .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+                    Some("image_url") => Some(item.clone()),
+                    Some("image") => anthropic_image_as_url(item),
+                    Some("input_image") => responses_image_as_url(item),
+                    _ => None,
+                })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Anthropic image block（source.type = base64/url）→ image_url 形态
+///（自抄 api_server::payload::anthropic_image_to_openai：跨层私有不可复用）
+fn anthropic_image_as_url(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    let url = match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media = source.get("media_type").and_then(Value::as_str)?;
+            let data = source.get("data").and_then(Value::as_str)?;
+            if data.is_empty() {
+                return None;
+            }
+            format!("data:{media};base64,{data}")
+        }
+        Some("url") => source.get("url").and_then(Value::as_str)?.to_string(),
+        _ => return None,
+    };
+    if url.is_empty() {
+        return None;
+    }
+    Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+}
+
+/// Responses input_image part（image_url/url 字段）→ image_url 形态
+fn responses_image_as_url(part: &Value) -> Option<Value> {
+    let url = part
+        .get("image_url")
+        .and_then(Value::as_str)
+        .or_else(|| part.get("url").and_then(Value::as_str))?;
+    if url.is_empty() {
+        return None;
+    }
+    Some(json!({ "type": "image_url", "image_url": { "url": url } }))
 }
 
 /// 把 OpenAI 的 messages 规整成上游能吃的形状（源实现 normalizeMessages）：
@@ -3216,6 +3257,43 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["content"], "q1");
         assert_eq!(out[1]["content"], "q2");
+    }
+
+    /// issue #154：images_of 变体识别——Anthropic image / Responses input_image
+    /// 直入 chat completions 时归一为 image_url 形态；坏块丢弃；OpenAI 主形态
+    /// 原样保留
+    #[test]
+    fn normalize_messages_image_variants() {
+        let messages = vec![
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "看图"},
+                // Anthropic base64 形态
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}},
+                // Responses input_image 形态
+                {"type": "input_image", "image_url": "https://example.com/x.png"},
+                // 坏块：空 data 应丢弃
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}},
+                // OpenAI 主形态
+                {"type": "image_url", "image_url": {"url": "https://example.com/y.png"}},
+            ]}),
+        ];
+        let out = normalize_messages(&messages);
+        let content = out[0]["content"].as_array().unwrap();
+        // 文本 + 3 张有效图（坏块被滤掉）
+        assert_eq!(content.len(), 4);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(
+            content[1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGk="}})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/x.png"}})
+        );
+        assert_eq!(
+            content[3],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/y.png"}})
+        );
     }
 
     #[test]

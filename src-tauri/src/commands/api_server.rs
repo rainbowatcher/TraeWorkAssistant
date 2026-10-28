@@ -407,8 +407,10 @@ pub async fn do_start(
                     return Err(match status {
                         // refresh_busy（H3）：跨进程刷新锁被他进程持有——暂态，
                         // 必须与 refresh_failed 同走熔断可自愈，否则会被误标
-                        // SessionDead 永久禁用（误标恰是 H3 要消除的后果）
-                        "refresh_failed" | "refresh_busy" => format!(
+                        // SessionDead 永久禁用（误标恰是 H3 要消除的后果）；
+                        // vault_down（issue #153 修复 2）：vault 系统性故障导致凭证
+                        // 读空——暂态，同样走熔断，故障恢复后自动自愈
+                        "refresh_failed" | "refresh_busy" | "vault_down" => format!(
                             "{}qoder 凭证暂不可用(id={acct_id}, status={status}；网络/服务端暂态或他进程正在刷新，稍后自动恢复)",
                             crate::tasks::qoder_common::TRANSIENT_ERR_TAG
                         ),

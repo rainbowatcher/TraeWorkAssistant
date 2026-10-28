@@ -174,6 +174,12 @@ impl AppState {
         std::fs::create_dir_all(&data_dir)
             .map_err(|e| format!("创建数据目录失败: {e}"))?;
 
+        // 修复 3（issue #153）：canonicalize 解析 Junction/目录联接到真实路径。
+        // APPDATA 下若存在联接链（如用户手工迁移目录），路径不解析会让 vault
+        // 等组件踩 os error 448（ERROR_UNTRUSTED_MOUNT_POINT）；解析失败（理论上
+        // 仅在极端 IO 环境发生）退回未解析路径，不阻塞启动
+        let data_dir = data_dir.canonicalize().unwrap_or(data_dir);
+
         // 创建子目录结构
         let conf_dir = data_dir.join("conf");
         let data_subdir = data_dir.join("data");

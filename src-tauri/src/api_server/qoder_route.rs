@@ -370,6 +370,31 @@ fn entry_is_global_only(model: &str, entry: &Value) -> bool {
     }
 }
 
+/// 请求体是否携带图片输入（issue #154 门控）：三协议形态统一识别——
+/// OpenAI `image_url` / Anthropic `image` / Responses `input_image`。
+/// 数组 content 递归一层（覆盖 tool_result.content 内嵌图片），字符串恒无图。
+fn body_has_image(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .any(|m| m.get("content").is_some_and(content_has_image))
+        })
+}
+
+fn content_has_image(content: &Value) -> bool {
+    match content {
+        Value::Array(items) => items.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("image_url") | Some("image") | Some("input_image")
+            ) || item.get("content").is_some_and(content_has_image)
+        }),
+        _ => false,
+    }
+}
+
 /// 字符边界安全截断（自抄 wb_route::safe_slice，私有不可复用）：
 /// 字节落点在多字节字符内时回退到前一个边界，避免超长上游响应体
 /// 整段进入错误消息/日志
@@ -683,6 +708,18 @@ fn run_qoder_stream(
             start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
         );
         send_stream_error(tx, proto, 404, &msg);
+        return;
+    }
+    // issue #154 图片门控：Qoder 上游是 agent 信封，图片走独立 image_urls 上传
+    // 通道（本项目未接线），messages 里的图片块上游读不到——与其静默丢图
+    //（F-63 红线：能力缺失必须明示），不如执行入口直接 400 拒绝
+    if body_has_image(&peek) {
+        let msg = "upstream 400 error: Qoder 池暂不支持图片输入（图片上传通道未接线，issue #154），请移除图片或改用支持视觉的非 Qoder 模型";
+        state.logger.log_request(
+            "qoder", "POST", "/v1/chat/completions", model, true, 400, "-",
+            start_ts.elapsed().as_millis() as u64, &key_name, "", Some(&msg),
+        );
+        send_stream_error(tx, proto, 400, &msg);
         return;
     }
     let model_key = entry
@@ -1323,6 +1360,14 @@ pub async fn qoder_aggregate_chat(
             return Err(format!(
                 "upstream 404 error: model {model} only available in Qoder Global region, not yet supported"
             ));
+        }
+        // issue #154 图片门控：同流式路径，F-63 红线明示拒绝而非静默丢图。
+        // "upstream 400 error:" 前缀走既有状态码解析通道透传 400
+        if body_has_image(&peek) {
+            return Err(
+                "upstream 400 error: Qoder 池暂不支持图片输入（图片上传通道未接线，issue #154），请移除图片或改用支持视觉的非 Qoder 模型"
+                    .to_string(),
+            );
         }
         let model_key = entry
             .get("upstreamKey")
@@ -2076,6 +2121,39 @@ mod tests {
         let empty_tail = json!({"messages": [{"role": "user", "content":
             "前文<system-reminder>注入</system-reminder>  \n"}]});
         assert_eq!(session_preview(&empty_tail), "前文");
+    }
+
+    /// issue #154：三协议图片形态统一识别（image_url / image / input_image），
+    /// 纯文本/字符串 content 恒无图；tool_result.content 内嵌图片递归命中
+    #[test]
+    fn body_has_image_detects_all_protocols() {
+        // OpenAI 形态
+        assert!(body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "看图"},
+            {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+        ]}]})));
+        // Anthropic 形态
+        assert!(body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+        ]}]})));
+        // Responses 形态
+        assert!(body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "https://example.com/b.png"}
+        ]}]})));
+        // tool_result.content 内嵌图片
+        assert!(body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": [
+                {"type": "image", "source": {"type": "url", "url": "https://example.com/c.png"}}
+            ]}
+        ]}]})));
+        // 纯文本：无图
+        assert!(!body_has_image(&json!({"messages": [{"role": "user", "content": "hi"}]})));
+        assert!(!body_has_image(&json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "纯文字"}
+        ]}]})));
+        // 无 messages / 空 content
+        assert!(!body_has_image(&json!({})));
+        assert!(!body_has_image(&json!({"messages": [{"role": "user"}]})));
     }
 
     /// 远程目录测试条目（adopt_remote 接受的最小合法信封载荷）

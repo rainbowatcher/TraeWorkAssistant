@@ -357,9 +357,48 @@ fn normalize_tools(obj: &mut serde_json::Map<String, Value>) {
 
 // ==================== Anthropic 协议输入（F-39：+Anthropic 适配） ====================
 
+/// Anthropic image block → OpenAI image_url 块（issue #154）：
+/// base64 源 → data URL；url 源 → 直透。两形态皆缺/为空时返回 None（丢弃
+/// 单个坏块而非整条消息）
+fn anthropic_image_to_openai(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    let url = match source.get("type").and_then(|t| t.as_str()) {
+        Some("base64") => {
+            let media = source.get("media_type").and_then(|m| m.as_str())?;
+            let data = source.get("data").and_then(|d| d.as_str())?;
+            if data.is_empty() {
+                return None;
+            }
+            format!("data:{media};base64,{data}")
+        }
+        Some("url") => source.get("url").and_then(|u| u.as_str())?.to_string(),
+        _ => return None,
+    };
+    if url.is_empty() {
+        return None;
+    }
+    Some(json!({ "type": "image_url", "image_url": { "url": url } }))
+}
+
+/// 组装 OpenAI content：无图保持纯字符串（下游 images_of 等文本消费方零影响），
+/// 有图输出 [{type:text},{type:image_url}] 数组形态
+fn openai_content(text_parts: Vec<String>, image_parts: &[Value]) -> Value {
+    if image_parts.is_empty() {
+        return json!(text_parts.join(""));
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    let text = text_parts.join("");
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text }));
+    }
+    parts.extend(image_parts.iter().cloned());
+    json!(parts)
+}
+
 /// Anthropic Messages 请求体 → OpenAI 内部格式（随后复用 OpenAI → llm_utils_chat 链路）
-/// 支持：system（字符串/blocks）、text blocks、tool_use/tool_result、tools、tool_choice
-/// 不支持：image 等多模态 block（跳过）；max_tokens 由 prepare_llm_chat_body 统一设 4096
+/// 支持：system（字符串/blocks）、text blocks、tool_use/tool_result、tools、tool_choice、
+/// image blocks（base64/url → OpenAI image_url，issue #154）
+/// 其余不支持类型仍跳过；max_tokens 由 prepare_llm_chat_body 统一设 4096
 pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
     let v: Value = match serde_json::from_slice(src) {
         Ok(v) => v,
@@ -431,6 +470,7 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
             }
             Some(Value::Array(blocks)) => {
                 let mut text_parts: Vec<String> = Vec::new();
+                let mut image_parts: Vec<Value> = Vec::new();
                 let mut tool_calls: Vec<Value> = Vec::new();
                 let mut tool_results: Vec<Value> = Vec::new();
                 for b in blocks {
@@ -439,6 +479,13 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
                         "text" => {
                             if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                                 text_parts.push(t.to_string());
+                            }
+                        }
+                        // issue #154：image block 不再静默丢弃——base64/url 两形态
+                        // 投影成 OpenAI image_url，上游视觉模型按各自能力消费
+                        "image" => {
+                            if let Some(img) = anthropic_image_to_openai(b) {
+                                image_parts.push(img);
                             }
                         }
                         "tool_use" => {
@@ -454,14 +501,29 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
                             }));
                         }
                         "tool_result" => {
+                            // issue #154：tool_result content 数组中的 image block
+                            // 同步映射（此前只取 text，内嵌图片静默丢失）
                             let content_str = match b.get("content") {
                                 Some(Value::String(s)) => s.clone(),
-                                Some(Value::Array(arr)) => arr
-                                    .iter()
-                                    .filter_map(|c| c.get("text"))
-                                    .filter_map(|t| t.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(""),
+                                Some(Value::Array(arr)) => {
+                                    let mut texts: Vec<String> = Vec::new();
+                                    for c in arr {
+                                        match c.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                                            "text" => {
+                                                if let Some(t) = c.get("text").and_then(|t| t.as_str()) {
+                                                    texts.push(t.to_string());
+                                                }
+                                            }
+                                            "image" => {
+                                                if let Some(img) = anthropic_image_to_openai(c) {
+                                                    image_parts.push(img);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    texts.join("")
+                                }
                                 _ => String::new(),
                             };
                             // is_error 透传（P2 修复）：OpenAI tool 消息无 is_error
@@ -493,8 +555,8 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
                     for tr in tool_results {
                         messages.push(tr);
                     }
-                    if !text_parts.is_empty() {
-                        messages.push(json!({ "role": role, "content": text_parts.join("") }));
+                    if !text_parts.is_empty() || !image_parts.is_empty() {
+                        messages.push(json!({ "role": role, "content": openai_content(text_parts, &image_parts) }));
                     }
                 } else if !tool_calls.is_empty() {
                     let mut m = json!({
@@ -503,8 +565,8 @@ pub fn anthropic_to_openai(src: &[u8]) -> Vec<u8> {
                     });
                     m["tool_calls"] = json!(tool_calls);
                     messages.push(m);
-                } else if !text_parts.is_empty() {
-                    messages.push(json!({ "role": role, "content": text_parts.join("") }));
+                } else if !text_parts.is_empty() || !image_parts.is_empty() {
+                    messages.push(json!({ "role": role, "content": openai_content(text_parts, &image_parts) }));
                 }
             }
             _ => {}
@@ -625,6 +687,76 @@ mod tests {
         // tools → OpenAI function 格式
         assert_eq!(out["tools"][0]["type"], "function");
         assert_eq!(out["tools"][0]["function"]["name"], "get_weather");
+    }
+
+    /// issue #154：image block（base64/url）→ OpenAI image_url；无图消息
+    /// 保持纯字符串；坏块（空 data）丢弃
+    #[test]
+    fn anthropic_image_conversion() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "这是什么？"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/a.png"}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": ""}}
+                ]}
+            ]
+        });
+        let out: Value = serde_json::from_slice(&anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice())).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "这是什么？");
+        assert_eq!(
+            content[1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}})
+        );
+        // 纯文本请求不走数组形态（下游 content_to_text 等零影响）
+        let plain = json!({
+            "model": "glm-5.2",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        let out2: Value = serde_json::from_slice(&anthropic_to_openai(serde_json::to_vec(&plain).unwrap().as_slice())).unwrap();
+        assert_eq!(out2["messages"][0]["content"], json!("hi"));
+    }
+
+    /// issue #154：tool_result content 数组内嵌 image 同步映射
+    #[test]
+    fn anthropic_tool_result_embedded_image() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [
+                        {"type": "text", "text": "截图结果："},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "YmFzZTY0"}}
+                    ]}
+                ]}
+            ]
+        });
+        let out: Value = serde_json::from_slice(&anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice())).unwrap();
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "tool");
+        assert_eq!(msgs[0]["tool_call_id"], "toolu_1");
+        assert_eq!(msgs[0]["content"], "截图结果：");
+        // 内嵌图片挂到随后的 user 回合消息
+        let content = msgs[1]["content"].as_array().unwrap();
+        assert_eq!(content[0]["type"], "image_url");
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "data:image/jpeg;base64,YmFzZTY0"
+        );
     }
 
     fn mo(id: &str, function: &str) -> super::super::models_sync::ModelOption {
