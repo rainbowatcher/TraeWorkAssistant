@@ -146,7 +146,7 @@ impl WbSseParser<InterruptibleLines> {
         loop {
             let line = match self.lines.next_timeout(poll) {
                 Ok(Some(line)) => line,
-                Ok(None) => return None, // 流结束（读错误折叠为 EOF；take_read_error 掐断哨兵仅 Trae 池 sse.rs 接线，Qoder/Buddy/custom 池分期跟进）
+                Ok(None) => return None, // 流结束（读错误折叠为 EOF；take_read_error 掐断哨兵已全池接线：Trae sse.rs 流式/聚合、qoder err_slot、custom 直连）
                 Err(()) => {
                     if client_gone() {
                         return None; // 客户端已断连：终止，不再读上游

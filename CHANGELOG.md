@@ -16,6 +16,7 @@
 - **Qoder 池接入指纹清洗管线（issue #158）**：流式/非流式请求支持句表清洗、工具别名与响应侧回改；设置页新增池级清洗开关（Buddy/Trae 共用 + Qoder 独立），热切换即时生效。
 - **Qoder 免费模型扩充（issue #156）**：DeepSeek-Flash 纳入免费模型（0 倍率），免费活动开关文案同步。
 - **图片输入适配（issue #154）**：Anthropic 内嵌图与 Responses input_image 统一映射 OpenAI image_url 上游；Qoder 上游不支持图片时明示 400 拒绝，不再静默丢图。
+- **PushPlus 微信推送渠道（issue #157）**：通知设置新增 PushPlus 渠道（Token / 推送模板 / 群组编码 topic 三项配置 + 格式校验 + 发送测试），与 Bark / Server酱 / 通用 Webhook 并列，随既有通知事件开关分发到全部应用。
 
 ### 修复加强
 

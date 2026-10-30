@@ -754,7 +754,11 @@ pub fn refresh_access_token(
         .set("Content-Type", "application/json")
         .send_string("{}");
     let body: serde_json::Value = match resp {
-        Ok(r) => r.into_json().unwrap_or_default(),
+        // 传输层故障如实上抛：unwrap_or_default 会把解码失败落 Value::Null，
+        // 最终误报「刷新响应中无 accessToken」伪装成凭证缺失，误导用户重新登录
+        Ok(r) => r
+            .into_json()
+            .map_err(|e| format!("刷新响应读取失败: {e}"))?,
         Err(ureq::Error::Status(code, r)) => {
             // issue #118：读错误响应体透传上游 error/error_description，便于区分会话失效与账号封禁
             return Err(wb_common::refresh_fail_msg(
@@ -933,7 +937,10 @@ fn refresh_access_token_intl(
         .set("Content-Type", "application/json")
         .send_string("{}");
     let body: serde_json::Value = match resp {
-        Ok(r) => r.into_json().unwrap_or_default(),
+        // intl 版对齐 CN 版：传输层故障如实上抛，不伪装「刷新响应中无 accessToken」
+        Ok(r) => r
+            .into_json()
+            .map_err(|e| format!("刷新响应读取失败: {e}"))?,
         Err(ureq::Error::Status(code, r)) => {
             // issue #118：读错误响应体透传上游 error/error_description，便于区分会话失效与账号封禁
             return Err(wb_common::refresh_fail_msg(

@@ -614,6 +614,12 @@ struct PlainCollect {
     finish_reason: String,
     usage: Option<Value>,
     error_info: Option<(i64, String)>,
+    /// 传输层掐断读错误（issue #158 报错A，P2-1 聚合侧补齐）：此前读错误被
+    /// `Err(_) => break` 静默折叠为 EOF——上游 h2 RST/连接重置掐断长响应时，
+    /// 半截内容以 finish_reason="stop" 完整返回客户端，tool_calls 残缺也不换号。
+    /// 仅留存传输掐断特征读错误（对齐流式侧 is_transport_cut_text 过滤口径），
+    /// 其余读错误维持折叠语义不变；saw_done 后的读错误不算（完整响应后关闭）
+    read_error: Option<String>,
     /// 审查修复（M6）：按 index 分段合并后的 tool_calls（与流式侧对称）
     tools: Vec<Value>,
 }
@@ -688,12 +694,24 @@ fn collect_plain<R: Read + Send>(reader: R) -> PlainCollect {
         finish_reason: "stop".to_string(),
         usage: None,
         error_info: None,
+        read_error: None,
         tools: Vec::new(),
     };
     for line in br.lines() {
         let line = match line {
             Ok(l) => l,
-            Err(_) => break,
+            Err(e) => {
+                // 传输层掐断捕获（聚合侧补齐，口径同流式侧 take_read_error）：
+                // 仅 !saw_done 且无业务错误时留存哨兵，交 aggregate/aggregate_text
+                // 上抛；其余读错误维持折叠语义
+                if !saw_done && out.error_info.is_none() {
+                    let text = e.to_string();
+                    if super::is_transport_cut_text(&text) {
+                        out.read_error = Some(text);
+                    }
+                }
+                break;
+            }
         };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
@@ -759,6 +777,17 @@ pub fn aggregate<R: Read + Send>(
     let mut c = collect_plain(reader);
     if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    // 传输层掐断哨兵上抛（聚合侧补齐，P2-1）：半截内容不得以 finish_reason="stop"
+    // 伪装成功，交调用方丢弃换号重试（routes 聚合错误分支 is_transport_cut 预检）
+    if let Some(e) = c.read_error {
+        return (
+            None,
+            Some((
+                super::TRANSPORT_CUT_CODE,
+                format!("{} {e}", super::TRANSPORT_CUT_MSG_PREFIX),
+            )),
+        );
     }
     // issue #150：别名回改——合并后的 tool_calls.function.name 还原客户端原名
     if let Some(m) = tool_alias {
@@ -826,6 +855,16 @@ pub fn aggregate_text<R: Read + Send>(
     let c = collect_plain(reader);
     if let Some((code, msg)) = &c.error_info {
         return (None, Some((*code, msg.clone())));
+    }
+    // 传输层掐断哨兵上抛（聚合侧补齐，P2-1）：同 aggregate
+    if let Some(e) = c.read_error {
+        return (
+            None,
+            Some((
+                super::TRANSPORT_CUT_CODE,
+                format!("{} {e}", super::TRANSPORT_CUT_MSG_PREFIX),
+            )),
+        );
     }
 
     let mut resp = json!({

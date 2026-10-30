@@ -423,6 +423,12 @@ fn anthropic_image_to_openai(block: &Value) -> Option<Value> {
     let url = match source.get("type").and_then(|t| t.as_str()) {
         Some("base64") => {
             let media = source.get("media_type").and_then(|m| m.as_str())?;
+            // MIME 白名单（客户端可控字段不直透上游）：异常 MIME 可注入 data: URL
+            // 前缀（如 text/html 诱导上游内容嗅探）。白名单外丢弃该块（同坏块丢弃
+            // 语义，不整条消息拒绝）
+            if !matches!(media, "image/png" | "image/jpeg" | "image/webp" | "image/gif") {
+                return None;
+            }
             let data = source.get("data").and_then(|d| d.as_str())?;
             if data.is_empty() {
                 return None;
@@ -814,6 +820,34 @@ mod tests {
         assert_eq!(
             content[0]["image_url"]["url"],
             "data:image/jpeg;base64,YmFzZTY0"
+        );
+    }
+
+    /// media_type 白名单（客户端可控 MIME 不直透上游）：白名单外丢弃该块，
+    /// 其余合法块不受影响
+    #[test]
+    fn anthropic_image_media_type_whitelist() {
+        let src = json!({
+            "model": "glm-5.2",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "text/html", "data": "PHNjcmlwdD4="}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/webp", "data": "d2VicA=="}}
+                ]}
+            ]
+        });
+        let out: Value = serde_json::from_slice(&anthropic_to_openai(serde_json::to_vec(&src).unwrap().as_slice())).unwrap();
+        let content = out["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2, "白名单外 MIME 块应被丢弃");
+        assert_eq!(
+            content[0]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/webp;base64,d2VicA=="
         );
     }
 

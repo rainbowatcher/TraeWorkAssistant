@@ -2666,6 +2666,20 @@ async fn aggregate_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: St
                                 return Ok(r);
                             }
                             (None, Some((code, msg))) => {
+                                // 传输层掐断预检（issue #158 报错A，P2-1 聚合侧补齐，
+                                // 须在 classify_solo_error 之前——与流式侧 2119 行同口径）：
+                                // 账号无关传输故障，不冷却、不解绑粘性、不计空完成指纹；
+                                // 非流式未向客户端发出任何内容，直接丢弃截断响应 break 换号
+                                //（截断的部分响应可能含残缺 tool_calls，不得当成功交付）
+                                if super::is_transport_cut(code, &msg) {
+                                    state.logger.log_request(
+                                        "trae", "POST", proto.log_path(), &model, stream,
+                                        200, &picked.uid, duration_ms, &key_name,
+                                        &state.pool.name_of(&picked.uid),
+                                        Some("传输层掐断（聚合响应已丢弃）→ 换号重试"),
+                                    );
+                                    break; // 换号
+                                }
                                 // 空完成哨兵（-9901，影子风控）计入指纹拦截观测；
                                 // 冷却行为维持现状（classify_solo_error → Server）
                                 if super::is_empty_completion(code, &msg) {

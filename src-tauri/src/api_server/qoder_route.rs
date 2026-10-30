@@ -888,13 +888,10 @@ fn run_qoder_stream(
                 tried.len(),
                 empty_hits,
             ));
-            let err_body = json!({
-                "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
-            });
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                "data: {err_body}\n\n"
-            ))));
-            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+            // 按客户端协议分流错误帧（Anthropic 收 event: error、Responses 收
+            // response.failed，不再裸 data: 帧不可读）；code 保持字符串
+            // "no_healthy_account"（客户端兼容）
+            send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
             return;
         }
         // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
@@ -941,13 +938,8 @@ fn run_qoder_stream(
                         tried.len(),
                         empty_hits,
                     ));
-                    let err_body = json!({
-                        "error": {"message": exhaust_msg, "type": "api_error", "code": "no_healthy_account"}
-                    });
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
-                        "data: {err_body}\n\n"
-                    ))));
-                    let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+                    // 按客户端协议分流错误帧（同预算耗尽收尾口径）
+                    send_stream_error_named(tx, proto, "no_healthy_account", &exhaust_msg);
                     return;
                 }
             },
@@ -1628,8 +1620,53 @@ pub async fn qoder_aggregate_chat(
 
         let mut tried: HashSet<String> = HashSet::new();
         let mut empty_hits: usize = 0; // 空完成计数：轮换耗尽收尾区分指纹拦截与账号耗尽
+        // 轮换预算（issue #156 聚合侧补齐，对齐流式路径）：聚合含「首字超时 10s × N
+        // 账号」逐号等待，无预算可拖过客户端读超时；仅约束「换号再试」（首个账号
+        // tried 空不受影响），超预算按 exhaust 语义收尾
+        let rotate_deadline = Instant::now() + Duration::from_secs(45);
 
         loop {
+            // 轮换预算检查：超预算不再取新号，按 exhaust 语义收尾（与下方取号
+            // 耗尽收尾逐行同构 + log_request(503)，非流式以 return Err 透传）
+            if !tried.is_empty() && Instant::now() > rotate_deadline {
+                let duration_ms = start_ts.elapsed().as_millis() as u64;
+                state.record_usage_qoder(
+                    &model, "none", &key_id, false, stream, duration_ms, 0, 0, None, None, None,
+                    &session_ctx(&peek),
+                );
+                let (healthy_total, _) = state.qoder_pool.selectable_stats_in(None, free_model);
+                let (hard_credit_cnt, _) = state.qoder_pool.hard_credit_stats();
+                let (exhaust_msg, exhaust_tag) = super::routes::exhaust_message(
+                    empty_hits,
+                    tried.len(),
+                    healthy_total,
+                    hard_credit_cnt,
+                );
+                // 模型级冷却与指纹判定同口径（对齐流式预算收尾）：空完成主导（指纹
+                // 拦截）时模型本身可用，不记 Server 冷却——冷却误伤且跨池回退拦不住
+                // 同指纹；仅非指纹主导（真 5xx/超时占多数）补记，后续请求预检快速失败
+                if exhaust_tag != "CHANNEL_FINGERPRINT_BLOCK" {
+                    note_model_server_cooldown(&model);
+                }
+                // issue #158 P1：池级指纹拦截短记忆（对齐流式/trae/buddy 池）——
+                // 空完成主导（指纹拦截）才标记，TTL 600s 内同池新请求激进清洗起步
+                super::wb_payload::mark_channel_fp_block("qoder", exhaust_tag == "CHANNEL_FINGERPRINT_BLOCK");
+                let sample_note = super::wb_payload::empty_sample_note(
+                    &exhaust_tag, "qoder", &body_vec,
+                );
+                if !sample_note.is_empty() {
+                    state.logger.log_debug_line(format!(
+                        "[DEBUG] {exhaust_tag} tried={} empty_hits={} pool=qoder rotate_budget_exhausted{sample_note}",
+                        tried.len(),
+                        empty_hits,
+                    ));
+                }
+                state.logger.log_request(
+                    "qoder", "POST", "/v1/chat/completions", &model, stream, 503, "none",
+                    duration_ms, &key_name, "", Some(&exhaust_msg),
+                );
+                return Err(exhaust_msg);
+            }
             // ── 取号：粘性命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
             let picked = match first_pick.take() {
                 Some(p) => p,
@@ -1814,6 +1851,11 @@ pub async fn qoder_aggregate_chat(
                             Ok(w) => w,
                             Err(()) => {
                                 state.qoder_pool.note_error(&picked.uid, ErrKind::Server);
+                                // issue #156 聚合侧补齐（对齐流式路径）：竞速双败
+                                // 补记模型级 Server 冷却——只 note 账号时，后续请求
+                                // 仍逐账号重演 10s 首字等待；补模型级冷却后走
+                                // dispatch 预检快速失败/跨池回退
+                                note_model_server_cooldown(&model);
                                 break;
                             }
                         };
@@ -2193,6 +2235,46 @@ fn send_stream_error(
                 "status": "failed",
                 "output": [],
                 "error": {"code": code.to_string(), "message": msg},
+            });
+            let body = json!({"type": "response.failed", "response": resp});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: response.failed\ndata: {}\n\n",
+                body
+            ))));
+        }
+        _ => {
+            let body = json!({"error": { "message": msg, "type": "api_error", "code": code }});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!("data: {}\n\n", body))));
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
+        }
+    }
+}
+
+/// 字符串 code 变体（轮换耗尽收尾专用）：错误 code 保持字符串 "no_healthy_account"
+/// 不变（客户端兼容，工程惯例）——i64 版会把它变数字。三协议分流形态同构
+/// send_stream_error；耗尽文案 exhaust_message 恒非空，空 msg 兜底用 code
+fn send_stream_error_named(
+    tx: &tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    proto: Protocol,
+    code: &str,
+    msg: &str,
+) {
+    let msg = if msg.trim().is_empty() { code } else { msg };
+    match proto {
+        Protocol::Anthropic => {
+            let err = json!({"type":"error","error":{"type":"api_error","message":msg}});
+            let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
+                "event: error\ndata: {}\n\n",
+                err
+            ))));
+        }
+        Protocol::Responses => {
+            let resp = json!({
+                "id": format!("resp_{}", now_ts()),
+                "object": "response",
+                "status": "failed",
+                "output": [],
+                "error": {"code": code, "message": msg},
             });
             let body = json!({"type": "response.failed", "response": resp});
             let _ = tx.blocking_send(Ok(bytes::Bytes::from(format!(
