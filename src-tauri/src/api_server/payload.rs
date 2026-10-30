@@ -82,6 +82,64 @@ fn sanitize_content(content: &mut Value, templates: &[(String, String)], seed: u
     }
 }
 
+/// OpenAI 形态请求体的纯清洗（issue #158 P1-1：Qoder 池专用入口）——与
+/// prepare_llm_chat_body 共用同一套规则表与文本清洗（strip_cc + 模板映射），
+/// 但**不做 Trae 专有形态转换**（function→function_call 改名、content 字符串→
+/// 数组均不适用：Qoder 信封构造 normalize_messages 自行处理形态）。
+/// 覆盖清洗点：messages[].content（字符串/文本块数组）+ assistant
+/// tool_calls[].function.arguments + tools[].function.description（JSON 字符串/
+/// 工具描述仅模板映射，与 Trae 同口径——审查修复：此前 Qoder 池工具描述漏洗，
+/// 残指纹自检只扫首条 system，该通道残留不可见）。
+/// `aggressive`：生效表追加激进短前缀规则（空完成换号重试/池级指纹拦截 TTL
+/// 内），与 prepare_llm_chat_body 同款门控。返回改写副本——调用方保留原始
+/// peek 供粘性键/session_ctx 取值（清洗不得漂移会话键与记账语义）。
+pub fn sanitize_openai_body(
+    src: &Value,
+    templates: &[(String, String)],
+    seed: u64,
+    aggressive: bool,
+) -> Value {
+    let aggressive_rules: Vec<(String, String)>;
+    let effective: &[(String, String)] = if aggressive {
+        let mut v = templates.to_vec();
+        v.extend(super::wb_payload::aggressive_template_rules());
+        aggressive_rules = v;
+        &aggressive_rules
+    } else {
+        templates
+    };
+    let mut obj = src.clone();
+    if let Some(msgs) = obj.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        for msg in msgs.iter_mut() {
+            let Some(m) = msg.as_object_mut() else { continue };
+            // assistant 历史 tool_calls：function.arguments 为 JSON 字符串，
+            // 仅模板映射（OpenAI 形态，不改名不移形态）
+            if let Some(tcs) = m.get_mut("tool_calls").and_then(|t| t.as_array_mut()) {
+                for tc in tcs.iter_mut() {
+                    if let Some(Value::String(args)) = tc.pointer_mut("/function/arguments") {
+                        *args = super::wb_payload::apply_template_map_seeded(
+                            args, effective, seed,
+                        );
+                    }
+                }
+            }
+            if let Some(content) = m.get_mut("content") {
+                sanitize_content(content, effective, seed);
+            }
+        }
+    }
+    // 指纹清洗：工具描述仅模板映射（客户端 harness 常在工具描述注入身份痕迹，
+    // 与 prepare_llm_chat_body 同口径）
+    if let Some(tools) = obj.get_mut("tools").and_then(|t| t.as_array_mut()) {
+        for tool in tools.iter_mut() {
+            if let Some(Value::String(desc)) = tool.pointer_mut("/function/description") {
+                *desc = super::wb_payload::apply_template_map_seeded(desc, effective, seed);
+            }
+        }
+    }
+    obj
+}
+
 /// OpenAI 请求体 → llm_utils_chat 请求体改写
 /// llm_utils_chat 消耗通用积分(product_id 208)
 /// `models` 为同步落库的模型目录（查表定 function，热路径有缓存）
@@ -972,5 +1030,35 @@ mod tests {
         assert_eq!(s0, pick(0)); // 同种子可复现
         assert_ne!(s0, pick(1)); // 跨种子候选变化
         assert!(s0.starts_with("Candidate "));
+    }
+
+    /// sanitize_openai_body（issue #158 P1-1，Qoder 池入口）：工具描述同样仅模板
+    /// 映射清洗（与 prepare_llm_chat_body 同口径）；无 tools 的 body 不受影响
+    #[test]
+    fn qoder_sanitize_openai_body_washes_tool_description() {
+        let templates = vec![(
+            "Main branch (you will usually use this with PRs)".to_string(),
+            "Default branch (you will usually use this with PRs)".to_string(),
+        )];
+        let src = json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "f",
+                "description": "Main branch (you will usually use this with PRs)",
+                "parameters": {}}}],
+        });
+        let out = sanitize_openai_body(&src, &templates, 0, false);
+        assert_eq!(
+            out["tools"][0]["function"]["description"],
+            "Default branch (you will usually use this with PRs)"
+        );
+        // 无 tools：清洗后仍无该键（结构不受清洗扰动）
+        let bare = json!({
+            "model": "glm-5.2",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out2 = sanitize_openai_body(&bare, &templates, 0, false);
+        assert!(out2.get("tools").is_none());
     }
 }

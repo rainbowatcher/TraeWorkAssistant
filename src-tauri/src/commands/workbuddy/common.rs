@@ -147,7 +147,7 @@ pub struct WorkBuddySettings {
     /// ⑤ 最小剩余积分：目标低于该值不切（0 = 关闭）
     #[serde(default)]
     pub cli_min_remaining_credits: f64,
-    // 失败通知渠道（F-19）：已迁移至 app Settings（通知渠道面板，Trae/Buddy 全平台共用）
+    // 失败通知渠道（F-19）：已迁移至 app Settings（通知渠道面板，全部应用共用）
     // UI 坐标点击签到兜底（F-18，批次4 T4.2）：仅手动触发，默认关闭
     #[serde(default)]
     pub ui_click_enabled: bool,
@@ -227,8 +227,8 @@ pub(crate) fn load_settings(state: &AppState) -> WorkBuddySettings {
     s
 }
 
-/// 失败通知统一入口（F-19；通知渠道面板，Trae/Buddy 全平台共用）：
-/// 桌面通知（有 AppHandle 时）+ Bark/通用 Webhook/Server酱 可选渠道。
+/// 失败通知统一入口（F-19；通知渠道面板，全部应用共用）：
+/// 桌面通知（有 AppHandle 时）+ Bark/通用 Webhook/Server酱/PushPlus 可选渠道。
 /// 配置来自 app Settings（kv `app_settings`，通知渠道面板维护）；
 /// 总开关 + 事件开关过滤；渠道失败静默记日志，不影响主流程。
 pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &str, body: &str, event: crate::notify::NotifyEvent) {
@@ -248,6 +248,9 @@ pub fn push_notify(app: Option<&AppHandle>, data_dir: &std::path::Path, title: &
         bark_url: s.notify_bark_url.clone().filter(|x| !x.trim().is_empty()),
         wechat_webhook: s.notify_webhook_url.clone().filter(|x| !x.trim().is_empty()),
         serverchan_sendkey: s.notify_serverchan_sendkey.clone().filter(|x| !x.trim().is_empty()),
+        pushplus_token: s.notify_pushplus_token.clone().filter(|x| !x.trim().is_empty()),
+        pushplus_template: s.notify_pushplus_template.clone(),
+        pushplus_topic: s.notify_pushplus_topic.clone(),
     };
     crate::notify::notify_all(app, data_dir, title, body, &channels);
 }

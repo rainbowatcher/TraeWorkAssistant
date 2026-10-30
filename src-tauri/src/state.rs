@@ -410,7 +410,7 @@ impl AppState {
         s.app_order.retain(|k| crate::models::is_valid_app_key(k));
         let mut seen_order = std::collections::HashSet::new();
         s.app_order.retain(|k| seen_order.insert(k.clone()));
-        // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，Trae/Buddy 共用）：
+        // 通知渠道迁移（F-19 → 系统设置页通知渠道面板，全部应用共用）：
         // app_settings 渠道字段双 None 时从旧 workbuddy_settings 一次性搬运。
         // 命中即 kv_set 回写持久化——push_notify 裸读 kv 不经过本函数，仅内存视图会让
         // 推送链路读不到迁移值（老用户通知静默失效）；同时移除旧 kv 的通知键，
